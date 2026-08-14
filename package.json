@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "description": "Plasma interoperability and FFI boundary for Cannon and Cannon+.",
   "type": "module",
-  "exports": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./adapters": "./src/adapters.js"
+  },
   "scripts": { "test": "node --test" },
   "engines": { "node": ">=20" },
   "license": "MIT"
