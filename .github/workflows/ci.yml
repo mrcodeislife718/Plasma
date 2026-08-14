@@ -8,6 +8,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         node: [22, 24]
     steps:
@@ -15,4 +16,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: npm test
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Install foreign runtimes and compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 ruby-full php-cli perl
+      - name: Install TypeScript proof toolchain
+        run: npm install --ignore-scripts
+      - name: Run JS TS C C++ Python JVM Ruby PHP Perl WASM and native-OS certification
+        run: npm test
