@@ -5,11 +5,20 @@ export const PlasmaType = Object.freeze({
   null: 'null', boolean: 'boolean', integer: 'integer', float: 'float', string: 'string', bytes: 'bytes', list: 'list', map: 'map', handle: 'handle'
 });
 
+export class PlasmaBoundaryError extends Error {
+  constructor(message, { code = 'PLASMA_BOUNDARY_ERROR', adapter = null, cause = null } = {}) {
+    super(message, cause ? { cause } : undefined);
+    this.name = 'PlasmaBoundaryError';
+    this.code = code;
+    this.adapter = adapter;
+  }
+}
+
 export function encodeValue(value) {
   if (value == null) return { type: PlasmaType.null, value: null };
   if (typeof value === 'boolean') return { type: PlasmaType.boolean, value };
   if (typeof value === 'bigint' || Number.isInteger(value)) return { type: PlasmaType.integer, value: String(value) };
-  if (typeof value === 'number') return { type: PlasmaType.float, value };
+  if (typeof value === 'number') { if (!Number.isFinite(value)) throw new TypeError('Plasma cannot encode non-finite numbers'); return { type: PlasmaType.float, value }; }
   if (typeof value === 'string') return { type: PlasmaType.string, value };
   if (Buffer.isBuffer(value) || value instanceof Uint8Array) return { type: PlasmaType.bytes, value: Buffer.from(value).toString('base64') };
   if (Array.isArray(value)) return { type: PlasmaType.list, value: value.map(encodeValue) };
@@ -30,16 +39,37 @@ export function decodeValue(encoded) {
 }
 
 export class HandleRegistry {
-  constructor() { this.handles = new Map(); }
-  retain(value, metadata = {}) { const id = randomUUID(); this.handles.set(id, { value, refs: 1, metadata }); return { type: PlasmaType.handle, id, metadata }; }
-  clone(id) { const entry = this.#get(id); entry.refs++; return { type: PlasmaType.handle, id, metadata: entry.metadata }; }
-  dereference(id) { return this.#get(id).value; }
-  release(id) { const entry = this.#get(id); entry.refs--; if (entry.refs <= 0) this.handles.delete(id); return entry.refs; }
-  #get(id) { const entry = this.handles.get(id); if (!entry) throw new Error(`unknown Plasma handle: ${id}`); return entry; }
+  constructor() { this.handles = new Map(); this.closed = false; }
+  retain(value, metadata = {}) {
+    this.#assertOpen();
+    const id = randomUUID();
+    this.handles.set(id, { value, refs: 1, metadata: structuredClone(metadata), createdAt: Date.now() });
+    return { type: PlasmaType.handle, id, metadata: structuredClone(metadata) };
+  }
+  clone(id) { this.#assertOpen(); const entry = this.#get(id); entry.refs++; return { type: PlasmaType.handle, id, metadata: structuredClone(entry.metadata) }; }
+  dereference(id) { this.#assertOpen(); return this.#get(id).value; }
+  release(id) {
+    this.#assertOpen();
+    const entry = this.#get(id);
+    if (entry.refs <= 0) throw new PlasmaBoundaryError(`invalid reference count for Plasma handle: ${id}`, { code: 'PLASMA_HANDLE_REFCOUNT' });
+    entry.refs--;
+    if (entry.refs === 0) this.handles.delete(id);
+    return entry.refs;
+  }
+  snapshot() { return [...this.handles.entries()].map(([id, entry]) => ({ id, refs: entry.refs, metadata: structuredClone(entry.metadata), createdAt: entry.createdAt })); }
+  leakReport() { return this.snapshot().filter((entry) => entry.refs > 0); }
+  close({ allowLeaks = false } = {}) {
+    if (this.closed) return;
+    const leaks = this.leakReport();
+    if (leaks.length && !allowLeaks) throw new PlasmaBoundaryError(`cannot close Plasma handle registry with ${leaks.length} live handle(s)`, { code: 'PLASMA_HANDLE_LEAK' });
+    this.handles.clear(); this.closed = true;
+  }
+  #assertOpen() { if (this.closed) throw new PlasmaBoundaryError('Plasma handle registry is closed', { code: 'PLASMA_HANDLE_REGISTRY_CLOSED' }); }
+  #get(id) { const entry = this.handles.get(id); if (!entry) throw new PlasmaBoundaryError(`unknown Plasma handle: ${id}`, { code: 'PLASMA_UNKNOWN_HANDLE' }); return entry; }
 }
 
 export class AdapterRegistry {
-  constructor() { this.adapters = new Map(); }
+  constructor({ policy = null } = {}) { this.adapters = new Map(); this.policy = policy; }
   register(name, adapter) {
     if (this.adapters.has(name)) throw new Error(`adapter already registered: ${name}`);
     for (const method of ['invoke','capabilities']) if (typeof adapter?.[method] !== 'function') throw new TypeError(`adapter ${name} missing ${method}()`);
@@ -49,8 +79,12 @@ export class AdapterRegistry {
   list() { return [...this.adapters].map(([name, adapter]) => ({ name, ...adapter.capabilities() })); }
   async invoke(name, call) {
     const started = Date.now();
-    try { return { ok: true, value: await this.get(name).invoke(call), adapter: name, durationMs: Date.now() - started }; }
-    catch (error) { return { ok: false, error: translateError(error, name, call), adapter: name, durationMs: Date.now() - started }; }
+    try {
+      if (this.policy) await this.policy({ adapter: name, call: structuredClone(call) });
+      return { ok: true, value: await this.get(name).invoke(call), adapter: name, durationMs: Date.now() - started };
+    } catch (error) {
+      return { ok: false, error: translateError(error, name, call), adapter: name, durationMs: Date.now() - started };
+    }
   }
 }
 
@@ -66,22 +100,70 @@ export function createJavaScriptAdapter(modules = {}) {
   };
 }
 
-export function createProcessAdapter({ language, command, args = [], protocol = 'jsonl' }) {
+export function createProcessAdapter({
+  language,
+  command,
+  args = [],
+  protocol = 'jsonl',
+  timeoutMs = 30_000,
+  maxOutputBytes = 4 * 1024 * 1024,
+  cwd = undefined,
+  env = {},
+  inheritEnvironment = ['PATH'],
+  killSignal = 'SIGKILL'
+}) {
+  if (!language || !command) throw new TypeError('process adapter requires language and command');
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new TypeError('timeoutMs must be a positive integer');
+  if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1) throw new TypeError('maxOutputBytes must be a positive integer');
+  const baseEnv = Object.fromEntries(inheritEnvironment.filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]]));
+  const childEnv = Object.freeze({ ...baseEnv, ...env });
   return {
-    capabilities: () => ({ language, async: true, bidirectional: true, protocol }),
-    invoke(call) {
+    capabilities: () => ({ language, async: true, bidirectional: true, protocol, timeoutMs, maxOutputBytes, environment: Object.keys(childEnv).sort() }),
+    invoke(call, { signal } = {}) {
       return new Promise((resolve, reject) => {
-        const child = spawn(command, args, { stdio: ['pipe','pipe','pipe'] });
-        let stdout = '', stderr = '';
-        child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-        child.stdout.on('data', (chunk) => stdout += chunk); child.stderr.on('data', (chunk) => stderr += chunk);
-        child.on('error', reject);
-        child.on('close', (code) => {
-          if (code !== 0) return reject(new Error(`${language} adapter exited ${code}: ${stderr.trim()}`));
-          try { resolve(protocol === 'jsonl' ? JSON.parse(stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? 'null') : stdout); }
-          catch (error) { reject(new Error(`${language} adapter returned invalid JSON: ${error.message}`)); }
+        let settled = false;
+        let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0);
+        const child = spawn(command, args, { stdio: ['pipe','pipe','pipe'], cwd, env: childEnv, windowsHide: true });
+        const finish = (error, value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal?.removeEventListener?.('abort', onAbort);
+          if (error) reject(error); else resolve(value);
+        };
+        const terminate = (error) => { if (!child.killed) child.kill(killSignal); finish(error); };
+        const timer = setTimeout(() => terminate(new PlasmaBoundaryError(`${language} adapter timed out after ${timeoutMs}ms`, { code: 'PLASMA_ADAPTER_TIMEOUT', adapter: language })), timeoutMs);
+        timer.unref?.();
+        const onAbort = () => terminate(signal.reason instanceof Error ? signal.reason : new PlasmaBoundaryError(`${language} adapter aborted`, { code: 'PLASMA_ADAPTER_ABORTED', adapter: language }));
+        if (signal?.aborted) return onAbort();
+        signal?.addEventListener?.('abort', onAbort, { once: true });
+        const append = (current, chunk, streamName) => {
+          const nextSize = current.length + chunk.length;
+          if (nextSize > maxOutputBytes) {
+            terminate(new PlasmaBoundaryError(`${language} adapter ${streamName} exceeded ${maxOutputBytes} bytes`, { code: 'PLASMA_ADAPTER_OUTPUT_LIMIT', adapter: language }));
+            return current;
+          }
+          return Buffer.concat([current, chunk], nextSize);
+        };
+        child.stdout.on('data', (chunk) => { stdout = append(stdout, Buffer.from(chunk), 'stdout'); });
+        child.stderr.on('data', (chunk) => { stderr = append(stderr, Buffer.from(chunk), 'stderr'); });
+        child.once('error', (error) => finish(new PlasmaBoundaryError(`${language} adapter failed to start: ${error.message}`, { code: 'PLASMA_ADAPTER_SPAWN', adapter: language, cause: error })));
+        child.once('close', (code, exitSignal) => {
+          if (settled) return;
+          if (code !== 0) return finish(new PlasmaBoundaryError(`${language} adapter exited ${code ?? 'null'}${exitSignal ? ` (${exitSignal})` : ''}: ${stderr.toString('utf8').trim()}`, { code: 'PLASMA_ADAPTER_EXIT', adapter: language }));
+          try {
+            if (protocol !== 'jsonl') return finish(null, stdout.toString('utf8'));
+            const lines = stdout.toString('utf8').trim().split(/\r?\n/).filter(Boolean);
+            if (lines.length !== 1) throw new Error(`expected exactly one JSON response line, received ${lines.length}`);
+            const parsed = JSON.parse(lines[0]);
+            finish(null, parsed);
+          } catch (error) {
+            finish(new PlasmaBoundaryError(`${language} adapter returned invalid ${protocol} response: ${error.message}`, { code: 'PLASMA_ADAPTER_PROTOCOL', adapter: language, cause: error }));
+          }
         });
-        child.stdin.end(JSON.stringify({ protocol: 'plasma/1', call }) + '\n');
+        const message = JSON.stringify({ protocol: 'plasma/1', call }) + '\n';
+        child.stdin.on('error', (error) => { if (error.code !== 'EPIPE') finish(new PlasmaBoundaryError(`${language} adapter stdin failed: ${error.message}`, { code: 'PLASMA_ADAPTER_STDIN', adapter: language, cause: error })); });
+        child.stdin.end(message);
       });
     }
   };
@@ -89,41 +171,28 @@ export function createProcessAdapter({ language, command, args = [], protocol = 
 
 export function generateBinding(spec, target) {
   validateSpec(spec);
-  const generators = {
-    c: generateC, cpp: generateCpp, python: generatePython, java: generateJava,
-    ruby: (s) => generateScriptBinding(s, 'ruby'), php: (s) => generateScriptBinding(s, 'php'), perl: (s) => generateScriptBinding(s, 'perl'),
-    wasm: generateWasmManifest
-  };
+  const generators = { c: generateC, cpp: generateCpp, python: generatePython, java: generateJava, ruby: (s) => generateScriptBinding(s, 'ruby'), php: (s) => generateScriptBinding(s, 'php'), perl: (s) => generateScriptBinding(s, 'perl'), wasm: generateWasmManifest };
   const generator = generators[target];
   if (!generator) throw new Error(`unsupported binding target: ${target}`);
   return generator(spec);
 }
 
-export function createBoundaryCall({ module, member, args = [], source = null, ownership = 'borrowed' }) {
-  return { id: randomUUID(), protocol: 'plasma/1', module, member, args: args.map(encodeValue), source, ownership, createdAt: new Date().toISOString() };
+export function createBoundaryCall({ module, member, args = [], source = null, ownership = 'borrowed', capabilities = [], deadline = null, traceId = null }) {
+  if (!module) throw new TypeError('boundary call requires module');
+  if (!['borrowed','owned','transferred'].includes(ownership)) throw new TypeError(`unsupported Plasma ownership mode: ${ownership}`);
+  if (deadline != null && (!Number.isFinite(deadline) || deadline <= Date.now())) throw new TypeError('deadline must be a future epoch-millisecond timestamp');
+  return { id: randomUUID(), protocol: 'plasma/1', module, member, args: args.map(encodeValue), source, ownership, capabilities: [...new Set(capabilities)].sort(), deadline, traceId, createdAt: new Date().toISOString() };
 }
 
 export function translateError(error, adapter, call) {
-  return { name: error?.name ?? 'Error', message: error?.message ?? String(error), adapter, module: call?.module ?? null, member: call?.member ?? null, source: call?.source ?? null, stack: error?.stack ?? null };
+  return { name: error?.name ?? 'Error', code: error?.code ?? null, message: error?.message ?? String(error), adapter, module: call?.module ?? null, member: call?.member ?? null, source: call?.source ?? null, traceId: call?.traceId ?? null, stack: error?.stack ?? null };
 }
 
-function validateSpec(spec) {
-  if (!spec?.name || !Array.isArray(spec.functions)) throw new TypeError('binding spec requires name and functions[]');
-}
-function generateC(spec) {
-  const lines = [`/* Generated by Plasma */`, `#pragma once`, `#include <stdint.h>`, `typedef struct plasma_context plasma_context;`];
-  for (const fn of spec.functions) lines.push(`int plasma_${spec.name}_${fn.name}(plasma_context* ctx);`);
-  return lines.join('\n') + '\n';
-}
-function generateCpp(spec) {
-  return `// Generated by Plasma\n#pragma once\nnamespace plasma::${spec.name} {\n${spec.functions.map((fn) => `  void ${fn.name}();`).join('\n')}\n}\n`;
-}
-function generatePython(spec) {
-  return `# Generated by Plasma\nclass ${pascal(spec.name)}:\n${spec.functions.map((fn) => `    def ${fn.name}(self, *args):\n        return self._plasma.invoke("${fn.name}", args)`).join('\n') || '    pass'}\n`;
-}
-function generateJava(spec) {
-  return `// Generated by Plasma\npublic interface ${pascal(spec.name)}Plasma {\n${spec.functions.map((fn) => `  Object ${fn.name}(Object... args);`).join('\n')}\n}\n`;
-}
+function validateSpec(spec) { if (!spec?.name || !Array.isArray(spec.functions)) throw new TypeError('binding spec requires name and functions[]'); for (const fn of spec.functions) if (!fn?.name) throw new TypeError('binding functions require names'); }
+function generateC(spec) { const lines = ['/* Generated by Plasma */', '#pragma once', '#include <stdint.h>', 'typedef struct plasma_context plasma_context;']; for (const fn of spec.functions) lines.push(`int plasma_${spec.name}_${fn.name}(plasma_context* ctx);`); return lines.join('\n') + '\n'; }
+function generateCpp(spec) { return `// Generated by Plasma\n#pragma once\nnamespace plasma::${spec.name} {\n${spec.functions.map((fn) => `  void ${fn.name}();`).join('\n')}\n}\n`; }
+function generatePython(spec) { return `# Generated by Plasma\nclass ${pascal(spec.name)}:\n${spec.functions.map((fn) => `    def ${fn.name}(self, *args):\n        return self._plasma.invoke("${fn.name}", args)`).join('\n') || '    pass'}\n`; }
+function generateJava(spec) { return `// Generated by Plasma\npublic interface ${pascal(spec.name)}Plasma {\n${spec.functions.map((fn) => `  Object ${fn.name}(Object... args);`).join('\n')}\n}\n`; }
 function generateScriptBinding(spec, language) { return `${language}:${spec.name}:${spec.functions.map((f)=>f.name).join(',')}\n`; }
 function generateWasmManifest(spec) { return JSON.stringify({ plasma: 1, module: spec.name, imports: spec.functions.map((fn) => ({ name: fn.name, parameters: fn.parameters ?? [], returns: fn.returns ?? 'any' })) }, null, 2); }
 function pascal(value) { return value.replace(/(^|[-_\s]+)(\w)/g, (_, __, c) => c.toUpperCase()); }
