@@ -139,6 +139,7 @@ export function createProcessAdapter({
     invoke(call, { signal } = {}) {
       return new Promise((resolve, reject) => {
         let settled = false;
+        let terminationError = null;
         let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0);
         const child = spawn(command, args, { stdio: ['pipe','pipe','pipe'], cwd, env: childEnv, windowsHide: true, shell: false });
         const finish = (error, value) => {
@@ -148,13 +149,20 @@ export function createProcessAdapter({
           signal?.removeEventListener?.('abort', onAbort);
           if (error) reject(error); else resolve(value);
         };
-        const terminate = (error) => { if (!child.killed) child.kill(killSignal); finish(error); };
+        const terminate = (error) => {
+          terminationError ??= error;
+          if (child.exitCode == null && child.signalCode == null) {
+            try { child.kill(killSignal); }
+            catch (killError) { terminationError ??= new PlasmaBoundaryError(`${language} adapter termination failed: ${killError.message}`, { code: 'PLASMA_ADAPTER_TERMINATION', adapter: language, cause: killError }); }
+          }
+        };
         const timer = setTimeout(() => terminate(new PlasmaBoundaryError(`${language} adapter timed out after ${timeoutMs}ms`, { code: 'PLASMA_ADAPTER_TIMEOUT', adapter: language })), timeoutMs);
         timer.unref?.();
         const onAbort = () => terminate(signal.reason instanceof Error ? signal.reason : new PlasmaBoundaryError(`${language} adapter aborted`, { code: 'PLASMA_ADAPTER_ABORTED', adapter: language }));
-        if (signal?.aborted) return onAbort();
-        signal?.addEventListener?.('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+        else signal?.addEventListener?.('abort', onAbort, { once: true });
         const append = (current, chunk, streamName) => {
+          if (terminationError) return current;
           const nextSize = current.length + chunk.length;
           if (nextSize > maxOutputBytes) {
             terminate(new PlasmaBoundaryError(`${language} adapter ${streamName} exceeded ${maxOutputBytes} bytes`, { code: 'PLASMA_ADAPTER_OUTPUT_LIMIT', adapter: language }));
@@ -167,6 +175,7 @@ export function createProcessAdapter({
         child.once('error', (error) => finish(new PlasmaBoundaryError(`${language} adapter failed to start: ${error.message}`, { code: 'PLASMA_ADAPTER_SPAWN', adapter: language, cause: error })));
         child.once('close', (code, exitSignal) => {
           if (settled) return;
+          if (terminationError) return finish(terminationError);
           if (code !== 0) return finish(new PlasmaBoundaryError(`${language} adapter exited ${code ?? 'null'}${exitSignal ? ` (${exitSignal})` : ''}: ${stderr.toString('utf8').trim()}`, { code: 'PLASMA_ADAPTER_EXIT', adapter: language }));
           try {
             if (protocol !== 'jsonl') return finish(null, stdout.toString('utf8'));
@@ -179,7 +188,7 @@ export function createProcessAdapter({
           }
         });
         const message = JSON.stringify({ protocol: 'plasma/1', call }) + '\n';
-        child.stdin.on('error', (error) => { if (error.code !== 'EPIPE') finish(new PlasmaBoundaryError(`${language} adapter stdin failed: ${error.message}`, { code: 'PLASMA_ADAPTER_STDIN', adapter: language, cause: error })); });
+        child.stdin.on('error', (error) => { if (error.code !== 'EPIPE' && !terminationError) finish(new PlasmaBoundaryError(`${language} adapter stdin failed: ${error.message}`, { code: 'PLASMA_ADAPTER_STDIN', adapter: language, cause: error })); });
         child.stdin.end(message);
       });
     }
@@ -206,8 +215,13 @@ export function translateError(error, adapter, call) {
 function raceWithBoundaryAbort(promise, signal) {
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(signal.reason);
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
-  ]);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => { cleanup(); reject(signal.reason); };
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); }
+    );
+  });
 }
