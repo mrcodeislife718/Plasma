@@ -137,6 +137,7 @@ export function createProcessAdapter({
   return {
     capabilities: () => ({ language, async: true, bidirectional: true, protocol, timeoutMs, maxOutputBytes, environment: Object.keys(childEnv).sort() }),
     invoke(call, { signal } = {}) {
+      if (signal?.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new PlasmaBoundaryError(`${language} adapter aborted`, { code: 'PLASMA_ADAPTER_ABORTED', adapter: language }));
       return new Promise((resolve, reject) => {
         let settled = false;
         let terminationError = null;
@@ -159,8 +160,7 @@ export function createProcessAdapter({
         const timer = setTimeout(() => terminate(new PlasmaBoundaryError(`${language} adapter timed out after ${timeoutMs}ms`, { code: 'PLASMA_ADAPTER_TIMEOUT', adapter: language })), timeoutMs);
         timer.unref?.();
         const onAbort = () => terminate(signal.reason instanceof Error ? signal.reason : new PlasmaBoundaryError(`${language} adapter aborted`, { code: 'PLASMA_ADAPTER_ABORTED', adapter: language }));
-        if (signal?.aborted) onAbort();
-        else signal?.addEventListener?.('abort', onAbort, { once: true });
+        signal?.addEventListener?.('abort', onAbort, { once: true });
         const append = (current, chunk, streamName) => {
           if (terminationError) return current;
           const nextSize = current.length + chunk.length;
