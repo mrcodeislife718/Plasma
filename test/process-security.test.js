@@ -56,6 +56,22 @@ test('process adapter aborts and cleans up foreign execution', async () => {
   await assert.rejects(() => pending, /cancelled by caller/);
 });
 
+test('pre-aborted process adapter invocation never starts foreign execution', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'plasma-preabort-'));
+  const marker = path.join(root, 'spawned');
+  const script = `require('fs').writeFileSync(${JSON.stringify(marker)},'started');`;
+  const adapter = createProcessAdapter({ language:'node-preabort', command:process.execPath, args:['-e',script], timeoutMs:5000 });
+  const controller = new AbortController();
+  controller.abort(new Error('cancel before spawn'));
+  try {
+    await assert.rejects(() => adapter.invoke({ module:'test', member:'noop', args:[] }, { signal:controller.signal }), /cancel before spawn/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await assert.rejects(fs.access(marker), (error) => error?.code === 'ENOENT');
+  } finally {
+    await fs.rm(root, { recursive:true, force:true });
+  }
+});
+
 test('process adapter timeout resolves only after the foreign pid is reaped', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'plasma-reap-'));
   const pidFile = path.join(root, 'pid');
