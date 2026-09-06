@@ -80,11 +80,27 @@ export class AdapterRegistry {
   list() { return [...this.adapters].map(([name, adapter]) => ({ name, ...adapter.capabilities() })); }
   async invoke(name, call) {
     const started = Date.now();
+    const deadline = call?.deadline ?? null;
+    let controller = null;
+    let timer = null;
     try {
-      if (this.policy) await this.policy({ adapter: name, call: structuredClone(call) });
-      return { ok: true, value: await this.get(name).invoke(call), adapter: name, durationMs: Date.now() - started };
+      if (deadline != null) {
+        if (!Number.isFinite(deadline)) throw new PlasmaBoundaryError('Plasma boundary deadline must be a finite epoch-millisecond timestamp', { code: 'PLASMA_BOUNDARY_DEADLINE', adapter: name });
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new PlasmaBoundaryError('Plasma boundary deadline has expired', { code: 'PLASMA_BOUNDARY_DEADLINE', adapter: name });
+        controller = new AbortController();
+        timer = setTimeout(() => controller.abort(new PlasmaBoundaryError('Plasma boundary deadline exceeded', { code: 'PLASMA_BOUNDARY_DEADLINE', adapter: name })), remaining);
+        timer.unref?.();
+      }
+      if (this.policy) await raceWithBoundaryAbort(Promise.resolve(this.policy({ adapter: name, call: structuredClone(call) })), controller?.signal);
+      const adapter = this.get(name);
+      const invocation = Promise.resolve(adapter.invoke(call, controller ? { signal: controller.signal } : undefined));
+      const value = await raceWithBoundaryAbort(invocation, controller?.signal);
+      return { ok: true, value, adapter: name, durationMs: Date.now() - started };
     } catch (error) {
       return { ok: false, error: translateError(error, name, call), adapter: name, durationMs: Date.now() - started };
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 }
@@ -185,4 +201,13 @@ export function createBoundaryCall({ module, member, args = [], source = null, o
 
 export function translateError(error, adapter, call) {
   return { name: error?.name ?? 'Error', code: error?.code ?? null, message: error?.message ?? String(error), adapter, module: call?.module ?? null, member: call?.member ?? null, source: call?.source ?? null, traceId: call?.traceId ?? null, stack: error?.stack ?? null };
+}
+
+function raceWithBoundaryAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+  ]);
 }
